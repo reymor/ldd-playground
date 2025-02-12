@@ -2,6 +2,7 @@
 
 #include <linux/fs.h>
 #include <linux/init.h>
+#include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
@@ -15,10 +16,16 @@
 #define SERIAL_RESET_COUNTER 0
 #define SERIAL_GET_COUNTER 1
 
+#define SERIAL_BUFSIZE 16
+
 struct serial_dev {
     void __iomem *regs;
     struct miscdevice miscdev;
     unsigned int counter;
+    char rx_buf[SERIAL_BUFSIZE];
+    unsigned int buf_rd;
+    unsigned int buf_wr;
+    wait_queue_head_t wait;
 };
 
 static const struct of_device_id serial_of_match[] = {
@@ -45,10 +52,43 @@ static void serial_write_char(struct serial_dev *serial, unsigned char c)
     reg_write(serial, c, UART_TX);
 }
 
-static ssize_t serial_read(struct file *file, char __user *buf,
+static irqreturn_t serial_irq_handler(int irq, void *dev_id)
+{
+    struct serial_dev *serial = dev_id;
+    unsigned char c;
+
+    c = reg_read(serial, UART_RX);
+    serial->rx_buf[serial->buf_wr++] = c;
+
+    if (serial->buf_wr >= SERIAL_BUFSIZE)
+        serial->buf_wr = 0;
+
+    wake_up(&serial->wait);
+
+    return IRQ_HANDLED;
+}
+
+static ssize_t serial_read(struct file *fp, char __user *buf,
                            size_t sz, loff_t *ppos)
 {
-    return -EINVAL;
+    struct miscdevice *miscdev_ptr = fp->private_data;
+    struct serial_dev *serial = container_of(miscdev_ptr, struct serial_dev, miscdev);
+    int ret;
+
+    ret = wait_event_interruptible(serial->wait, serial->buf_wr != serial->buf_rd);
+    if (ret)
+        return ret;
+
+    ret = put_user(serial->rx_buf[serial->buf_rd++], buf);
+
+    if (serial->buf_rd >= SERIAL_BUFSIZE)
+        serial->buf_rd = 0;
+
+    if (ret)
+        return ret;
+
+    *ppos += 1;
+    return 1;
 }
 
 static ssize_t serial_write(struct file *fp, const char __user *buf,
@@ -109,6 +149,7 @@ static int serial_probe(struct platform_device *pdev)
     struct serial_dev *serial;
     struct resource *res;
     unsigned int uartclk, baud_divisor;
+    int irq;
 
     pr_info("Called %s\n", __func__);
 
@@ -143,6 +184,23 @@ static int serial_probe(struct platform_device *pdev)
     // clear uart fifos
     reg_write(serial, UART_FCR_CLEAR_RCVR | UART_FCR_CLEAR_XMIT, UART_FCR);
 
+    init_waitqueue_head(&serial->wait);
+
+    irq = platform_get_irq(pdev, 0);
+    if (irq < 0) {
+        ret = irq;
+        goto disable_runtime_pm;
+    }
+
+    ret = devm_request_irq(&pdev->dev, irq, serial_irq_handler, 0, pdev->name, serial);
+    if (ret) {
+        dev_err(&pdev->dev, "Failed to register interrupt handler\n");
+        goto disable_runtime_pm;
+    }
+
+    // enable rx interrupts
+    reg_write(serial, UART_IER_RDI, UART_IER);
+
     res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
     if (!res) {
         ret = -EINVAL;
@@ -165,7 +223,7 @@ static int serial_probe(struct platform_device *pdev)
         goto disable_runtime_pm;
     }
 
-	return 0;
+    return 0;
 disable_runtime_pm:
     pm_runtime_disable(&pdev->dev);
 
